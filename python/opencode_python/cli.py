@@ -16,6 +16,7 @@ from .session import Session, Mode
 from .provider import ProviderManager, OpenAIProvider, AnthropicProvider, GitHubCopilotProvider
 from .auth import Auth, ApiKeyInfo
 from .util.log import Log
+from .server import Server
 
 app = typer.Typer(
     name="opencode",
@@ -217,12 +218,12 @@ async def _run_async(
 
 @app.command()
 def serve(
-    port: int = typer.Option(8080, "--port", "-p", help="Port to serve on"),
-    host: str = typer.Option("localhost", "--host", help="Host to serve on"),
+    port: int = typer.Option(4096, "--port", "-p", help="Port to serve on"),
+    host: str = typer.Option("127.0.0.1", "--host", "-h", help="Host to serve on"),
+    reload: bool = typer.Option(False, "--reload", help="Enable auto-reload for development"),
 ):
     """Start the OpenCode server."""
-    console.print(f"[yellow]Server mode not yet implemented in this port[/yellow]")
-    console.print(f"Would start server on {host}:{port}")
+    asyncio.run(_serve_async(port, host, reload))
 
 
 auth_app = typer.Typer(help="Manage authentication with AI providers")
@@ -791,6 +792,45 @@ async def _manage_config(show: bool, set_key: Optional[str], value: Optional[str
             console.print("[yellow]Use --show to view config or --set/--value to update[/yellow]")
     
     await App.provide(".", config_with_app)
+
+
+async def _serve_async(port: int, host: str, reload: bool):
+    """Async implementation of serve command."""
+    async def serve_with_app(app_info):
+        # Check if providers are available
+        has_providers = await Server.check_providers()
+        if not has_providers:
+            console.print("[red]No providers available[/red]")
+            console.print("You need to configure at least one provider to use the server.")
+            console.print("Run: [cyan]opencode auth login[/cyan] to set up authentication")
+            return
+        
+        console.print("[bold]Starting OpenCode Server[/bold]")
+        console.print()
+        console.print(f"[blue]Host:[/blue] {host}")
+        console.print(f"[blue]Port:[/blue] {port}")
+        console.print(f"[blue]Reload:[/blue] {reload}")
+        console.print()
+        console.print(f"[green]Server will be available at:[/green] [cyan]http://{host}:{port}[/cyan]")
+        console.print(f"[green]API documentation:[/green] [cyan]http://{host}:{port}/docs[/cyan]")
+        console.print(f"[green]OpenAPI spec:[/green] [cyan]http://{host}:{port}/doc[/cyan]")
+        console.print()
+        console.print("[dim]Press Ctrl+C to stop the server[/dim]")
+        console.print()
+        
+        # Create and run server
+        from .server.server import ServerConfig
+        config = ServerConfig(port=port, host=host, reload=reload)
+        server = Server(config)
+        
+        try:
+            await server.serve()
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Server stopped[/yellow]")
+        except Exception as e:
+            console.print(f"\n[red]Server error: {e}[/red]")
+    
+    await App.provide(".", serve_with_app)
 
 
 def main():
