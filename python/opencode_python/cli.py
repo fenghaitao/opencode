@@ -573,9 +573,11 @@ async def _auth_list_async():
 @app.command()
 def models(
     provider: Optional[str] = typer.Option(None, "--provider", "-p", help="Filter by provider"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show detailed model information"),
+    authenticated_only: bool = typer.Option(False, "--auth-only", "-a", help="Show only models from authenticated providers"),
 ):
     """List available models."""
-    console.print("[yellow]Model listing not yet implemented in this port[/yellow]")
+    asyncio.run(_list_models_async(provider, verbose, authenticated_only))
 
 
 @app.command()
@@ -640,6 +642,135 @@ def config(
 ):
     """Manage configuration."""
     asyncio.run(_manage_config(show, set_key, value))
+
+
+async def _list_models_async(provider_filter: Optional[str], verbose: bool, authenticated_only: bool):
+    """Async implementation of models command."""
+    async def list_models_with_app(app_info):
+        # Register all providers
+        ProviderManager.register(OpenAIProvider())
+        ProviderManager.register(AnthropicProvider())
+        ProviderManager.register(GitHubCopilotProvider())
+        
+        providers = ProviderManager.list()
+        
+        if not providers:
+            console.print("[red]No providers available[/red]")
+            return
+        
+        # Filter by provider if specified
+        if provider_filter:
+            providers = [p for p in providers if p.id == provider_filter]
+            if not providers:
+                console.print(f"[red]Provider '{provider_filter}' not found[/red]")
+                console.print("Available providers:")
+                for p in ProviderManager.list():
+                    console.print(f"  - {p.id}")
+                return
+        
+        # Filter by authentication status if requested
+        if authenticated_only:
+            authenticated_providers = []
+            for p in providers:
+                if await p.is_authenticated():
+                    authenticated_providers.append(p)
+            providers = authenticated_providers
+            
+            if not providers:
+                console.print("[yellow]No authenticated providers found[/yellow]")
+                console.print("Run: [cyan]opencode auth login[/cyan] to authenticate")
+                return
+        
+        if verbose:
+            # Detailed view
+            console.print("[bold]Available Models[/bold]")
+            console.print()
+            
+            for provider in providers:
+                try:
+                    provider_info = await provider.get_info()
+                    is_authenticated = await provider.is_authenticated()
+                    
+                    # Provider header
+                    auth_status = "[green]✓[/green]" if is_authenticated else "[red]✗[/red]"
+                    console.print(f"[bold blue]{provider_info.name}[/bold blue] {auth_status}")
+                    console.print(f"  [dim]{provider_info.description}[/dim]")
+                    
+                    if not is_authenticated and provider_info.auth_url:
+                        console.print(f"  [dim]Get API key: {provider_info.auth_url}[/dim]")
+                    
+                    console.print()
+                    
+                    # Models
+                    if provider_info.models:
+                        for model in provider_info.models:
+                            console.print(f"  [cyan]{provider.id}/{model.id}[/cyan]")
+                            console.print(f"    {model.name}")
+                            console.print(f"    [dim]{model.description}[/dim]")
+                            
+                            # Model capabilities
+                            capabilities = []
+                            if model.supports_tools:
+                                capabilities.append("Tools")
+                            if model.supports_streaming:
+                                capabilities.append("Streaming")
+                            if capabilities:
+                                console.print(f"    [dim]Capabilities: {', '.join(capabilities)}[/dim]")
+                            
+                            # Context and cost info
+                            console.print(f"    [dim]Context: {model.context_length:,} tokens[/dim]")
+                            if model.cost_per_input_token is not None and model.cost_per_output_token is not None:
+                                if model.cost_per_input_token == 0 and model.cost_per_output_token == 0:
+                                    console.print(f"    [dim]Cost: Free (with subscription)[/dim]")
+                                else:
+                                    console.print(f"    [dim]Cost: ${model.cost_per_input_token:.6f}/1K input, ${model.cost_per_output_token:.6f}/1K output[/dim]")
+                            
+                            console.print()
+                    else:
+                        console.print("  [dim]No models available[/dim]")
+                        console.print()
+                
+                except Exception as e:
+                    console.print(f"  [red]Error loading provider info: {e}[/red]")
+                    console.print()
+        else:
+            # Simple list view (like TypeScript version)
+            console.print("[bold]Available Models[/bold]")
+            console.print()
+            
+            model_count = 0
+            for provider in providers:
+                try:
+                    provider_info = await provider.get_info()
+                    is_authenticated = await provider.is_authenticated()
+                    
+                    for model in provider_info.models:
+                        auth_indicator = "" if is_authenticated else " [dim](not authenticated)[/dim]"
+                        console.print(f"[cyan]{provider.id}/{model.id}[/cyan]{auth_indicator}")
+                        model_count += 1
+                
+                except Exception as e:
+                    console.print(f"[red]Error loading {provider.id}: {e}[/red]")
+            
+            if model_count == 0:
+                console.print("[dim]No models available[/dim]")
+            else:
+                console.print()
+                console.print(f"[dim]{model_count} models available[/dim]")
+                
+                if not authenticated_only:
+                    # Show authentication hint
+                    unauthenticated_count = 0
+                    for provider in providers:
+                        if not await provider.is_authenticated():
+                            provider_info = await provider.get_info()
+                            unauthenticated_count += len(provider_info.models)
+                    
+                    if unauthenticated_count > 0:
+                        console.print(f"[dim]{unauthenticated_count} models require authentication[/dim]")
+                        console.print("[dim]Run: [cyan]opencode auth login[/cyan] to authenticate[/dim]")
+    
+    await App.provide(".", list_models_with_app)
 
 
 async def _manage_config(show: bool, set_key: Optional[str], value: Optional[str]):
