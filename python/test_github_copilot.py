@@ -64,6 +64,23 @@ async def test_github_copilot():
         
         print("✅ Authentication successful!")
         
+        # Test token refresh functionality
+        print("\n🔄 Testing token refresh...")
+        try:
+            from opencode_python.auth import GitHubCopilotAuthManager
+            
+            # Force a token refresh to test the new functionality
+            token = await GitHubCopilotAuthManager.get_access_token(force_refresh=True)
+            if token:
+                print("✅ Token refresh successful!")
+                print(f"🔑 Token length: {len(token)}")
+            else:
+                print("❌ Token refresh failed")
+                return
+        except Exception as e:
+            print(f"❌ Token refresh test failed: {e}")
+            return
+        
         # Test a simple chat request
         print("\n🧪 Testing chat functionality...")
         
@@ -91,6 +108,10 @@ async def test_github_copilot():
             print("\nYou can now use:")
             print("  opencode run --model github-copilot/gpt-4o 'Help me code'")
             print("  opencode run --model github-copilot/o1-preview 'Complex reasoning task'")
+            print("\n🆕 New features:")
+            print("  - Automatic token refresh when expired")
+            print("  - Better error handling and logging")
+            print("  - Improved authentication flow")
             
         except Exception as e:
             print(f"❌ Chat test failed: {e}")
@@ -98,6 +119,7 @@ async def test_github_copilot():
             print("1. Expired GitHub Copilot subscription")
             print("2. Invalid or expired tokens")
             print("3. Network connectivity issues")
+            print("4. Try running the authentication again:")
     
     await App.provide(".", lambda _: run_test())
 

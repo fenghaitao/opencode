@@ -8,165 +8,10 @@ from typing import Dict, List, Optional
 import httpx
 from pydantic import BaseModel
 
-from ..auth import Auth, OAuthInfo
+from ..auth import Auth, OAuthInfo, GitHubCopilotAuthManager
 from ..util.error import NamedError
 from ..util.log import Log
 from .provider import Provider, ProviderInfo, ModelInfo, ChatRequest, ChatResponse, ChatMessage
-
-
-class DeviceCodeResponse(BaseModel):
-    """Device code response from GitHub."""
-    device_code: str
-    user_code: str
-    verification_uri: str
-    expires_in: int
-    interval: int
-
-
-class AccessTokenResponse(BaseModel):
-    """Access token response from GitHub."""
-    access_token: Optional[str] = None
-    error: Optional[str] = None
-    error_description: Optional[str] = None
-
-
-class CopilotTokenResponse(BaseModel):
-    """Copilot token response."""
-    token: str
-    expires_at: int
-    refresh_in: int
-    endpoints: Dict[str, str]
-
-
-class GitHubCopilotAuth:
-    """GitHub Copilot authentication handler."""
-    
-    CLIENT_ID = "Iv1.b507a08c87ecfe98"
-    DEVICE_CODE_URL = "https://github.com/login/device/code"
-    ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token"
-    COPILOT_API_KEY_URL = "https://api.github.com/copilot_internal/v2/token"
-    
-    HEADERS = {
-        "User-Agent": "GitHubCopilotChat/0.26.7",
-        "Editor-Version": "vscode/1.99.3",
-        "Editor-Plugin-Version": "copilot-chat/0.26.7",
-    }
-    
-    _log = Log.create({"service": "github-copilot-auth"})
-    
-    @classmethod
-    async def authorize(cls) -> Dict[str, any]:
-        """Start device authorization flow."""
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                cls.DEVICE_CODE_URL,
-                headers={
-                    "Accept": "application/json",
-                    "Content-Type": "application/json",
-                    **cls.HEADERS,
-                },
-                json={
-                    "client_id": cls.CLIENT_ID,
-                    "scope": "read:user",
-                }
-            )
-            response.raise_for_status()
-            
-            data = DeviceCodeResponse(**response.json())
-            return {
-                "device": data.device_code,
-                "user": data.user_code,
-                "verification": data.verification_uri,
-                "interval": data.interval or 5,
-                "expiry": data.expires_in,
-            }
-    
-    @classmethod
-    async def poll(cls, device_code: str) -> str:
-        """Poll for access token."""
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                cls.ACCESS_TOKEN_URL,
-                headers={
-                    "Accept": "application/json",
-                    "Content-Type": "application/json",
-                    **cls.HEADERS,
-                },
-                json={
-                    "client_id": cls.CLIENT_ID,
-                    "device_code": device_code,
-                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                }
-            )
-            
-            if not response.is_success:
-                return "failed"
-            
-            data = AccessTokenResponse(**response.json())
-            
-            if data.access_token:
-                # Store the GitHub OAuth token
-                auth_info = OAuthInfo(
-                    refresh=data.access_token,
-                    access="",
-                    expires=0
-                )
-                await Auth.set("github-copilot", auth_info)
-                cls._log.info("Stored GitHub OAuth token", {"token_length": len(data.access_token)})
-                return "complete"
-            
-            if data.error == "authorization_pending":
-                return "pending"
-            
-            if data.error:
-                return "failed"
-            
-            return "pending"
-    
-    @classmethod
-    async def access(cls, refresh_token: Optional[str] = None) -> Optional[str]:
-        """Get Copilot API access token."""
-        # Get stored auth info
-        auth_info = await Auth.get("github-copilot")
-        if not auth_info or auth_info.type != "oauth":
-            return None
-        
-        oauth_info = auth_info
-        
-        # Use provided refresh token or stored one
-        github_token = refresh_token or oauth_info.refresh
-        
-        # Check if we have a valid access token
-        if oauth_info.access and oauth_info.expires > int(time.time() * 1000):
-            return oauth_info.access
-        
-        # Get new Copilot API token
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                cls.COPILOT_API_KEY_URL,
-                headers={
-                    "Accept": "application/json",
-                    "Authorization": f"Bearer {github_token}",
-                    **cls.HEADERS,
-                }
-            )
-            
-            if not response.is_success:
-                cls._log.error("Failed to get Copilot token", {"status": response.status_code})
-                return None
-            
-            token_data = CopilotTokenResponse(**response.json())
-            
-            # Store the updated token info
-            updated_auth = OAuthInfo(
-                refresh=github_token,
-                access=token_data.token,
-                expires=token_data.expires_at * 1000
-            )
-            await Auth.set("github-copilot", updated_auth)
-            cls._log.info("Updated Copilot token", {"expires_at": token_data.expires_at})
-            
-            return token_data.token
 
 
 class GitHubCopilotProvider(Provider):
@@ -174,7 +19,7 @@ class GitHubCopilotProvider(Provider):
     
     def __init__(self):
         super().__init__("github-copilot")
-        self._auth = GitHubCopilotAuth()
+        self._auth = GitHubCopilotAuthManager()
         self._log = Log.create({"service": "github-copilot"})
     
     async def get_info(self) -> ProviderInfo:
@@ -248,7 +93,7 @@ class GitHubCopilotProvider(Provider):
     async def chat(self, request: ChatRequest) -> ChatResponse:
         """Send chat request to GitHub Copilot."""
         # Get access token
-        access_token = await self._auth.access()
+        access_token = await self._auth.get_access_token()
         if not access_token:
             raise RuntimeError("GitHub Copilot authentication required")
         
@@ -382,11 +227,7 @@ class GitHubCopilotProvider(Provider):
     
     async def is_authenticated(self) -> bool:
         """Check if GitHub Copilot is authenticated."""
-        try:
-            access_token = await self._auth.access()
-            return access_token is not None
-        except Exception:
-            return False
+        return await self._auth.is_authenticated()
     
     async def authenticate(self, **kwargs) -> bool:
         """Authenticate with GitHub Copilot using device flow."""
@@ -399,11 +240,26 @@ class GitHubCopilotProvider(Provider):
     
     async def start_device_flow(self) -> Dict[str, any]:
         """Start device authorization flow."""
-        return await self._auth.authorize()
+        result = await self._auth.start_device_flow()
+        return {
+            "device": result.device,
+            "user": result.user,
+            "verification": result.verification,
+            "interval": result.interval,
+            "expiry": result.expiry,
+        }
     
     async def poll_device_flow(self, device_code: str) -> str:
         """Poll device authorization flow."""
-        return await self._auth.poll(device_code)
+        success = await self._auth.complete_device_flow(device_code)
+        if success:
+            # Check if we actually got the tokens
+            if await self.is_authenticated():
+                return "complete"
+            else:
+                return "pending"
+        else:
+            return "failed"
 
 
 # Error classes
