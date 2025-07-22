@@ -18,7 +18,7 @@ MAX_LINE_LENGTH = 2000
 class ReadParameters(BaseModel):
     """Parameters for read tool."""
     
-    file_path: str = Field(description="The path to the file to read")
+    filePath: str = Field(description="The path to the file to read")
     offset: Optional[int] = Field(
         default=None,
         ge=0,
@@ -46,10 +46,10 @@ class ReadTool(Tool):
         app_info = App.info()
         
         # Resolve file path
-        if not os.path.isabs(args.file_path):
-            file_path = os.path.join(app_info.path["cwd"], args.file_path)
+        if not os.path.isabs(args.filePath):
+            file_path = os.path.join(app_info.path["cwd"], args.filePath)
         else:
-            file_path = args.file_path
+            file_path = args.filePath
         
         file_path = os.path.normpath(file_path)
         
