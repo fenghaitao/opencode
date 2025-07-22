@@ -17,6 +17,13 @@ from .provider import ProviderManager, OpenAIProvider, AnthropicProvider, GitHub
 from .auth import Auth, ApiKeyInfo
 from .util.log import Log
 from .server import Server
+# TUI import is optional
+try:
+    from .tui import OpenCodeTUI
+    TUI_AVAILABLE = OpenCodeTUI is not None
+except ImportError:
+    OpenCodeTUI = None
+    TUI_AVAILABLE = False
 
 app = typer.Typer(
     name="opencode",
@@ -831,6 +838,74 @@ async def _serve_async(port: int, host: str, reload: bool):
             console.print(f"\n[red]Server error: {e}[/red]")
     
     await App.provide(".", serve_with_app)
+
+
+@app.command()
+def tui(
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Model to use (provider/model)"),
+    mode: Optional[str] = typer.Option(None, "--mode", help="Mode to use"),
+    project: Optional[str] = typer.Option(None, "--project", help="Project directory"),
+):
+    """Start the OpenCode Terminal User Interface."""
+    if not TUI_AVAILABLE:
+        console.print("[red]TUI not available[/red]")
+        console.print("Install textual with: [cyan]pip install textual[/cyan]")
+        return
+    
+    asyncio.run(_tui_async(model, mode, project))
+
+
+async def _tui_async(model: Optional[str], mode: Optional[str], project: Optional[str]):
+    """Async implementation of TUI command."""
+    async def tui_with_app(app_info):
+        console.print("[bold]Starting OpenCode TUI[/bold]")
+        console.print()
+        
+        if model:
+            console.print(f"[blue]Model:[/blue] {model}")
+        if mode:
+            console.print(f"[blue]Mode:[/blue] {mode}")
+        if project:
+            console.print(f"[blue]Project:[/blue] {project}")
+        
+        console.print("[dim]Loading interface...[/dim]")
+        console.print()
+        
+        try:
+            # Import and run TUI
+            from .tui.app import OpenCodeTUI
+            
+            # Create TUI app with initial settings
+            tui_app = OpenCodeTUI()
+            
+            # Set initial model if provided
+            if model and "/" in model:
+                provider_id, model_id = model.split("/", 1)
+                # Store for later use in TUI
+                tui_app.initial_provider = provider_id
+                tui_app.initial_model = model_id
+            
+            # Run the TUI
+            await tui_app.run_async()
+            
+        except ImportError as e:
+            console.print(f"[red]TUI dependencies not available: {e}[/red]")
+            console.print("Install with: [cyan]pip install textual[/cyan]")
+        except KeyboardInterrupt:
+            console.print("\n[yellow]TUI stopped[/yellow]")
+        except Exception as e:
+            console.print(f"[red]TUI error: {e}[/red]")
+    
+    # Change to project directory if specified
+    if project:
+        import os
+        try:
+            os.chdir(project)
+        except Exception as e:
+            console.print(f"[red]Failed to change to project directory: {e}[/red]")
+            return
+    
+    await App.provide(".", tui_with_app)
 
 
 def main():
