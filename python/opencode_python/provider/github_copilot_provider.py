@@ -271,6 +271,151 @@ class GitHubCopilotProvider(Provider):
         except Exception as e:
             raise RuntimeError(f"GitHub Copilot API error: {e}")
     
+    async def chat_streaming(self, request: ChatRequest):
+        """Send streaming chat request to GitHub Copilot."""
+        # Get access token
+        access_token = await self._auth.get_access_token()
+        if not access_token:
+            raise RuntimeError("GitHub Copilot authentication required")
+        
+        # Prepare headers
+        headers = {
+            "Accept": "text/event-stream",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {access_token}",
+            "Openai-Intent": "conversation-edits",
+            "User-Agent": "GitHubCopilotChat/0.26.7",
+            "Editor-Version": "vscode/1.99.3",
+            "Editor-Plugin-Version": "copilot-chat/0.26.7",
+        }
+        
+        # Check if this is an agent call
+        is_agent_call = any(
+            msg.role in ["tool", "assistant"] 
+            for msg in request.messages 
+            if hasattr(msg, 'role')
+        )
+        
+        if is_agent_call:
+            headers["X-Initiator"] = "agent"
+        else:
+            headers["X-Initiator"] = "user"
+        
+        # Convert messages to OpenAI format
+        messages = []
+        for msg in request.messages:
+            openai_msg = {
+                "role": msg.role,
+                "content": msg.content,
+            }
+            if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                openai_msg["tool_calls"] = msg.tool_calls
+            messages.append(openai_msg)
+        
+        # Prepare request payload
+        payload = {
+            "model": request.model,
+            "messages": messages,
+            "stream": True,  # Force streaming
+        }
+        
+        if request.temperature is not None:
+            payload["temperature"] = request.temperature
+        
+        if request.max_tokens is not None:
+            payload["max_tokens"] = request.max_tokens
+        
+        if request.tools:
+            payload["tools"] = request.tools
+        
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                self._log.info("Sending streaming request to GitHub Copilot", {
+                    "model": request.model,
+                    "message_count": len(messages),
+                    "has_tools": bool(request.tools)
+                })
+                
+                async with client.stream(
+                    "POST",
+                    "https://api.githubcopilot.com/chat/completions",
+                    headers=headers,
+                    json=payload
+                ) as response:
+                    
+                    if not response.is_success:
+                        error_text = await response.aread()
+                        self._log.error("GitHub Copilot streaming API error", {
+                            "status": response.status_code,
+                            "response": error_text.decode('utf-8')[:500]
+                        })
+                        raise httpx.HTTPStatusError(
+                            f"GitHub Copilot API error: {response.status_code}",
+                            request=response.request,
+                            response=response
+                        )
+                    
+                    # Process Server-Sent Events
+                    async for line in response.aiter_lines():
+                        if not line.strip():
+                            continue
+                        
+                        if line.startswith("data: "):
+                            data_str = line[6:]  # Remove "data: " prefix
+                            
+                            if data_str.strip() == "[DONE]":
+                                yield {"type": "complete"}
+                                break
+                            
+                            try:
+                                data = json.loads(data_str)
+                                choices = data.get("choices", [])
+                                
+                                if choices:
+                                    choice = choices[0]
+                                    delta = choice.get("delta", {})
+                                    
+                                    # Handle content
+                                    if "content" in delta and delta["content"]:
+                                        yield {
+                                            "type": "content",
+                                            "content": delta["content"]
+                                        }
+                                    
+                                    # Handle tool calls
+                                    if "tool_calls" in delta and delta["tool_calls"]:
+                                        yield {
+                                            "type": "tool_calls",
+                                            "tool_calls": delta["tool_calls"]
+                                        }
+                                    
+                                    # Handle finish reason
+                                    if choice.get("finish_reason"):
+                                        usage = data.get("usage")
+                                        if usage:
+                                            usage = {
+                                                "prompt_tokens": usage.get("prompt_tokens", 0),
+                                                "completion_tokens": usage.get("completion_tokens", 0),
+                                                "total_tokens": usage.get("total_tokens", 0),
+                                            }
+                                        yield {
+                                            "type": "complete",
+                                            "usage": usage,
+                                            "finish_reason": choice["finish_reason"]
+                                        }
+                                        break
+                                        
+                            except json.JSONDecodeError:
+                                # Skip malformed JSON
+                                continue
+                                
+        except Exception as e:
+            self._log.error("GitHub Copilot streaming error", {"error": str(e)})
+            yield {
+                "type": "error",
+                "content": f"Streaming error: {str(e)}"
+            }
+    
     async def is_authenticated(self) -> bool:
         """Check if GitHub Copilot is authenticated."""
         return await self._auth.is_authenticated()

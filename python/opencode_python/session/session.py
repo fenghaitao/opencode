@@ -12,8 +12,8 @@ from pydantic import BaseModel
 from ..app import App
 from ..util.log import Log
 from ..tools import ToolRegistry, ToolContext, ToolResult
-from ..provider.provider import ChatRequest, ChatMessage as ProviderChatMessage, ChatResponse
-from ..provider import ProviderManager
+from ..provider.provider import ChatRequest, ChatMessage as ProviderChatMessage, ChatResponse, StreamingChatResponse
+from ..provider import ProviderManager, OpenAIProvider, AnthropicProvider, GitHubCopilotProvider
 from .message import Message, MessagePart
 from .mode import Mode
 from .system import SystemPrompt
@@ -49,10 +49,72 @@ class SessionChatResponse(BaseModel):
     usage: Optional[Dict[str, Any]] = None
 
 
+class StreamingSessionResponse:
+    """Streaming response from session chat."""
+    
+    def __init__(self, session_id: str, message_id: str):
+        self.session_id = session_id
+        self.message_id = message_id
+        self.content = ""
+        self.tool_calls = []
+        self.usage = None
+        self.is_complete = False
+        self._chunks = []
+        self._processing_started = False
+        self._processing_complete = False
+    
+    def __aiter__(self):
+        """Async iterator for streaming chunks."""
+        return self
+    
+    async def __anext__(self):
+        """Get next chunk."""
+        # Wait for processing to start
+        while not self._processing_started and not self.is_complete:
+            await asyncio.sleep(0.01)
+            
+        while True:
+            if self._chunks:
+                return self._chunks.pop(0)
+            elif self.is_complete:
+                raise StopAsyncIteration
+            else:
+                # Wait for more chunks or completion
+                await asyncio.sleep(0.01)
+    
+    def add_chunk(self, chunk_type: str, content: str = "", **kwargs):
+        """Add a streaming chunk."""
+        chunk = {
+            "type": chunk_type,
+            "content": content,
+            **kwargs
+        }
+        self._chunks.append(chunk)
+        
+        if chunk_type == "content":
+            self.content += content
+    
+    def complete(self, usage: Optional[Dict[str, Any]] = None):
+        """Mark the response as complete."""
+        self.usage = usage
+        self.is_complete = True
+        self.add_chunk("complete")
+
+
 class Session:
     """Session management."""
     
     _log = Log.create({"service": "session"})
+    _providers_registered = False
+    
+    @classmethod
+    def _ensure_providers_registered(cls):
+        """Ensure providers are registered."""
+        if not cls._providers_registered:
+            ProviderManager.register(OpenAIProvider())
+            ProviderManager.register(AnthropicProvider())
+            ProviderManager.register(GitHubCopilotProvider())
+            cls._providers_registered = True
     
     @classmethod
     async def create(cls, mode: str = "default") -> SessionInfo:
@@ -188,98 +250,163 @@ class Session:
     
     @classmethod
     async def chat(cls, request: SessionChatRequest) -> SessionChatResponse:
-        """Process a chat request with full system prompt and tool integration."""
-        cls._log.info("Chat request", {
+        """Process a chat request with full system prompt and tool integration (non-streaming)."""
+        # For backward compatibility, convert streaming to non-streaming
+        streaming_response = await cls.chat_streaming(request)
+        content = ""
+        tool_calls = []
+        usage = None
+        
+        async for chunk in streaming_response:
+            if chunk["type"] == "content":
+                content += chunk["content"]
+            elif chunk["type"] == "tool_calls":
+                tool_calls = chunk.get("tool_calls", [])
+            elif chunk["type"] == "complete":
+                usage = chunk.get("usage")
+        
+        return SessionChatResponse(
+            content=content,
+            tool_calls=tool_calls,
+            usage=usage
+        )
+    
+    @classmethod
+    async def chat_streaming(cls, request: SessionChatRequest) -> StreamingSessionResponse:
+        """Process a streaming chat request with full system prompt and tool integration."""
+        # Ensure providers are registered
+        cls._ensure_providers_registered()
+        
+        cls._log.info("Streaming chat request", {
             "session_id": request.session_id,
             "provider": request.provider_id,
             "model": request.model_id,
             "mode": request.mode
         })
         
-        try:
-            # Get mode configuration
-            mode = await Mode.get(request.mode)
-            
-            # Build system prompts
-            system_prompts = []
-            
-            # Add provider-specific prompts
-            system_prompts.extend(SystemPrompt.provider(request.model_id))
-            
-            # Add environment context
-            system_prompts.extend(await SystemPrompt.environment())
-            
-            # Add custom instructions
-            system_prompts.extend(await SystemPrompt.custom())
-            
-            # Add mode-specific prompt
-            if mode.system_prompt:
-                system_prompts.append(mode.system_prompt)
-            
-            # Combine system prompts (max 2 for caching)
-            if len(system_prompts) > 2:
-                combined_system = [system_prompts[0], "\n\n".join(system_prompts[1:])]
-            else:
-                combined_system = system_prompts
-            
-            # Get available tools
-            available_tools = ToolRegistry.list_available(mode.tools)
-            tools_spec = ToolRegistry.to_openai_format(available_tools) if available_tools else None
-            
-            # Create messages for the provider
-            messages = []
-            
-            # Add system messages
-            for system_msg in combined_system:
-                if system_msg.strip():
-                    messages.append(ProviderChatMessage(role="system", content=system_msg))
-            
-            # Add user message
-            messages.append(ProviderChatMessage(role="user", content=request.message_content))
-            
-            # Get provider and send request
-            provider = ProviderManager.get(request.provider_id)
-            if not provider:
-                raise Exception(f"Provider {request.provider_id} not found")
-            
-            if not await provider.is_authenticated():
-                raise Exception(f"Not authenticated with {request.provider_id}")
-            
-            # Create chat request
-            chat_request = ChatRequest(
-                messages=messages,
-                model=request.model_id,
-                max_tokens=4096,
-                tools=tools_spec
-            )
-            
-            # Send to provider
-            response = await provider.chat(chat_request)
-            
-            # Handle tool calls if present
-            if response.tool_calls:
-                tool_results = await cls._execute_tool_calls(
-                    response.tool_calls,
-                    request.session_id,
-                    "temp-message-id"  # TODO: Use proper message ID
+        # Create streaming response
+        streaming_response = StreamingSessionResponse(request.session_id, "temp-message-id")
+        
+        # Define async processing function
+        async def _process_streaming():
+            try:
+                # Mark processing as started
+                streaming_response._processing_started = True
+                
+                # Get mode configuration
+                mode = await Mode.get(request.mode)
+                
+                # Build system prompts
+                system_prompts = []
+                
+                # Add provider-specific prompts
+                system_prompts.extend(SystemPrompt.provider(request.model_id))
+                
+                # Add environment context
+                system_prompts.extend(await SystemPrompt.environment())
+                
+                # Add custom instructions
+                system_prompts.extend(await SystemPrompt.custom())
+                
+                # Add mode-specific prompt
+                if mode.system_prompt:
+                    system_prompts.append(mode.system_prompt)
+                
+                # Combine system prompts (max 2 for caching)
+                if len(system_prompts) > 2:
+                    combined_system = [system_prompts[0], "\n\n".join(system_prompts[1:])]
+                else:
+                    combined_system = system_prompts
+                
+                # Get available tools
+                available_tools = ToolRegistry.list_available(mode.tools)
+                tools_spec = ToolRegistry.to_openai_format(available_tools) if available_tools else None
+                
+                # Create messages for the provider
+                messages = []
+                
+                # Add system messages
+                for system_msg in combined_system:
+                    if system_msg.strip():
+                        messages.append(ProviderChatMessage(role="system", content=system_msg))
+                
+                # Add user message
+                messages.append(ProviderChatMessage(role="user", content=request.message_content))
+                
+                # Get provider and send request
+                provider = ProviderManager.get(request.provider_id)
+                if not provider:
+                    raise Exception(f"Provider {request.provider_id} not found")
+                
+                if not await provider.is_authenticated():
+                    raise Exception(f"Not authenticated with {request.provider_id}")
+                
+                # Create chat request with streaming enabled
+                chat_request = ChatRequest(
+                    messages=messages,
+                    model=request.model_id,
+                    max_tokens=4096,
+                    tools=tools_spec,
+                    stream=True
                 )
                 
-                # Add tool results to response
-                response.content += "\n\n" + "\n".join(tool_results)
-            
-            return SessionChatResponse(
-                content=response.content,
-                tool_calls=response.tool_calls,
-                usage=response.usage
-            )
-            
-        except Exception as e:
-            cls._log.error("Chat error", {"error": str(e)})
-            return SessionChatResponse(
-                content=f"Error: {str(e)}",
-                tool_calls=[],
-                usage=None
-            )
+                # Check if provider supports streaming
+                if hasattr(provider, 'chat_streaming'):
+                    # Use streaming if available
+                    async for chunk in provider.chat_streaming(chat_request):
+                        if chunk.get("type") == "content":
+                            streaming_response.add_chunk("content", chunk.get("content", ""))
+                        elif chunk.get("type") == "tool_calls":
+                            streaming_response.tool_calls = chunk.get("tool_calls", [])
+                            streaming_response.add_chunk("tool_calls", tool_calls=chunk.get("tool_calls", []))
+                        elif chunk.get("type") == "complete":
+                            streaming_response.complete(chunk.get("usage"))
+                            break
+                else:
+                    # Fallback to non-streaming
+                    streaming_response.add_chunk("status", "Generating response...")
+                    response = await provider.chat(chat_request)
+                    
+                    # Simulate streaming by breaking content into chunks
+                    content = response.content
+                    chunk_size = 20  # Smaller chunks for more visible streaming
+                    for i in range(0, len(content), chunk_size):
+                        chunk = content[i:i + chunk_size]
+                        streaming_response.add_chunk("content", chunk)
+                        # Longer delay to make streaming more visible
+                        await asyncio.sleep(0.1)
+                    
+                    # Handle tool calls
+                    if response.tool_calls:
+                        streaming_response.tool_calls = response.tool_calls
+                        streaming_response.add_chunk("tool_calls", tool_calls=response.tool_calls)
+                        
+                        # Execute tools and stream results
+                        tool_results = await cls._execute_tool_calls_streaming(
+                            response.tool_calls,
+                            request.session_id,
+                            "temp-message-id",
+                            streaming_response
+                        )
+                    
+                    streaming_response.complete(response.usage)
+                    
+            except Exception as e:
+                cls._log.error("Chat error", {"error": str(e)})
+                streaming_response.add_chunk("error", f"Error: {str(e)}")
+                streaming_response.complete()
+            finally:
+                # Ensure processing is marked as started even if there's an error
+                if not streaming_response._processing_started:
+                    streaming_response._processing_started = True
+        
+        # Start the async processing task and store reference
+        task = asyncio.create_task(_process_streaming())
+        
+        # Store task reference so it doesn't get garbage collected
+        streaming_response._background_task = task
+        
+        return streaming_response
     
     @classmethod
     async def _execute_tool_calls(
@@ -317,6 +444,55 @@ class Session:
                 
             except Exception as e:
                 results.append(f"[{function_name}] Error: {str(e)}")
+        
+        return results
+    
+    @classmethod
+    async def _execute_tool_calls_streaming(
+        cls,
+        tool_calls: List[Dict[str, Any]],
+        session_id: str,
+        message_id: str,
+        streaming_response: StreamingSessionResponse
+    ) -> List[str]:
+        """Execute tool calls with streaming updates."""
+        results = []
+        
+        for tool_call in tool_calls:
+            try:
+                function_name = tool_call.get("function", {}).get("name", "")
+                arguments_str = tool_call.get("function", {}).get("arguments", "{}")
+                
+                # Parse arguments
+                try:
+                    arguments = json.loads(arguments_str) if isinstance(arguments_str, str) else arguments_str
+                except json.JSONDecodeError:
+                    arguments = {}
+                
+                # Stream tool execution start
+                streaming_response.add_chunk("tool_start", f"Executing {function_name}...")
+                
+                # Create tool context
+                abort_event = asyncio.Event()
+                context = ToolContext(
+                    session_id=session_id,
+                    message_id=message_id,
+                    abort_event=abort_event,
+                    metadata_callback=lambda x: None  # TODO: Implement metadata handling
+                )
+                
+                # Execute tool
+                result = await ToolRegistry.execute_tool(function_name, arguments, context)
+                
+                # Stream tool result
+                tool_result = f"[{function_name}] {result.output}"
+                streaming_response.add_chunk("tool_result", tool_result)
+                results.append(tool_result)
+                
+            except Exception as e:
+                error_msg = f"[{function_name}] Error: {str(e)}"
+                streaming_response.add_chunk("tool_error", error_msg)
+                results.append(error_msg)
         
         return results
     

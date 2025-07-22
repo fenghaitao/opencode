@@ -48,7 +48,7 @@ class ChatRequest(BaseModel):
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     tools: Optional[List[Dict[str, Any]]] = None
-    stream: bool = False
+    stream: bool = True  # Enable streaming by default
 
 
 class ChatResponse(BaseModel):
@@ -58,6 +58,25 @@ class ChatResponse(BaseModel):
     tool_calls: List[Dict[str, Any]] = []
     usage: Optional[Dict[str, Any]] = None
     finish_reason: Optional[str] = None
+
+
+class StreamingChatResponse:
+    """Streaming response from AI provider."""
+    
+    def __init__(self):
+        self.content = ""
+        self.tool_calls = []
+        self.usage = None
+        self.finish_reason = None
+        self.is_complete = False
+    
+    def __aiter__(self):
+        """Async iterator for streaming chunks."""
+        return self
+    
+    async def __anext__(self):
+        """Get next chunk - to be implemented by providers."""
+        raise StopAsyncIteration
 
 
 class Provider(ABC):
