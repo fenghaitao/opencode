@@ -6,14 +6,14 @@ from typing import List
 from pydantic import BaseModel, Field
 
 from .tool import Tool, ToolContext, ToolResult
-from .edit import EditTool, EditParams
+from .edit import EditTool, EditParameters
 from ..app import App
 
 
 class MultiEditParams(BaseModel):
     """Parameters for MultiEdit tool."""
     filePath: str = Field(description="The absolute path to the file to modify")
-    edits: List[EditParams] = Field(description="Array of edit operations to perform sequentially on the file")
+    edits: List[EditParameters] = Field(description="Array of edit operations to perform sequentially on the file")
 
 
 class MultiEditTool(Tool):
@@ -44,7 +44,7 @@ class MultiEditTool(Tool):
         
         for edit in args.edits:
             # Create edit parameters for each edit
-            edit_args = EditParams(
+            edit_args = EditParameters(
                 filePath=args.filePath,
                 oldString=edit.oldString,
                 newString=edit.newString,
