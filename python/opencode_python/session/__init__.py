@@ -1,14 +1,16 @@
 """Session management for OpenCode Python."""
 
-from .session import Session, SessionInfo, ChatRequest, ChatResponse
+from .session import Session, SessionInfo, SessionChatRequest, SessionChatResponse
 from .message import Message, MessagePart, TextPart, ToolPart
 from .mode import Mode, ModeInfo
+from .system import SystemPrompt
 
 __all__ = [
     "Session",
     "SessionInfo", 
-    "ChatRequest",
-    "ChatResponse",
+    "SessionChatRequest",
+    "SessionChatResponse",
+    "SystemPrompt",
     "Message",
     "MessagePart",
     "TextPart", 
