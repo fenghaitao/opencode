@@ -1,6 +1,7 @@
 """Tool system for OpenCode Python."""
 
 from .tool import Tool, ToolContext, ToolInfo, ToolResult
+from .registry import ToolRegistry
 from .bash import BashTool
 from .edit import EditTool
 from .glob import GlobTool
@@ -21,6 +22,7 @@ __all__ = [
     "ToolContext", 
     "ToolInfo",
     "ToolResult",
+    "ToolRegistry",
     "BashTool",
     "EditTool",
     "GlobTool",

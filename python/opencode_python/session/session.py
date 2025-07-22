@@ -2,16 +2,21 @@
 
 import json
 import uuid
+import asyncio
 from datetime import datetime
 from pathlib import Path
-from typing import AsyncGenerator, Dict, List, Optional
+from typing import AsyncGenerator, Dict, List, Optional, Any
 
 from pydantic import BaseModel
 
 from ..app import App
 from ..util.log import Log
+from ..tools import ToolRegistry, ToolContext, ToolResult
+from ..provider.provider import ChatRequest, ChatMessage as ProviderChatMessage, ChatResponse
+from ..provider import ProviderManager
 from .message import Message, MessagePart
 from .mode import Mode
+from .system import SystemPrompt
 
 
 class SessionInfo(BaseModel):
@@ -25,20 +30,23 @@ class SessionInfo(BaseModel):
     mode: str = "default"
 
 
-class ChatRequest(BaseModel):
-    """Request to chat with AI."""
+class SessionChatRequest(BaseModel):
+    """Request to chat with AI in a session context."""
     
     session_id: str
     provider_id: str
     model_id: str
-    mode: str
-    parts: List[Dict]  # MessagePart data
+    mode: str = "default"
+    message_content: str
+    tools_enabled: Optional[Dict[str, bool]] = None
 
 
-class ChatResponse(BaseModel):
-    """Response from chat."""
+class SessionChatResponse(BaseModel):
+    """Response from session chat."""
     
-    parts: List[MessagePart]
+    content: str
+    tool_calls: List[Dict[str, Any]] = []
+    usage: Optional[Dict[str, Any]] = None
 
 
 class Session:
@@ -179,15 +187,8 @@ class Session:
         return messages
     
     @classmethod
-    async def chat(cls, request: ChatRequest) -> ChatResponse:
-        """Process a chat request."""
-        # This is a placeholder - in a real implementation, this would:
-        # 1. Load the session and mode
-        # 2. Create a user message from the request parts
-        # 3. Send to the AI provider
-        # 4. Execute any tools requested by the AI
-        # 5. Return the AI's response
-        
+    async def chat(cls, request: SessionChatRequest) -> SessionChatResponse:
+        """Process a chat request with full system prompt and tool integration."""
         cls._log.info("Chat request", {
             "session_id": request.session_id,
             "provider": request.provider_id,
@@ -195,11 +196,129 @@ class Session:
             "mode": request.mode
         })
         
-        # For now, return a simple response
-        from .message import TextPart
-        response_part = TextPart(text="This is a placeholder response. AI integration not yet implemented.")
+        try:
+            # Get mode configuration
+            mode = await Mode.get(request.mode)
+            
+            # Build system prompts
+            system_prompts = []
+            
+            # Add provider-specific prompts
+            system_prompts.extend(SystemPrompt.provider(request.model_id))
+            
+            # Add environment context
+            system_prompts.extend(await SystemPrompt.environment())
+            
+            # Add custom instructions
+            system_prompts.extend(await SystemPrompt.custom())
+            
+            # Add mode-specific prompt
+            if mode.system_prompt:
+                system_prompts.append(mode.system_prompt)
+            
+            # Combine system prompts (max 2 for caching)
+            if len(system_prompts) > 2:
+                combined_system = [system_prompts[0], "\n\n".join(system_prompts[1:])]
+            else:
+                combined_system = system_prompts
+            
+            # Get available tools
+            available_tools = ToolRegistry.list_available(mode.tools)
+            tools_spec = ToolRegistry.to_openai_format(available_tools) if available_tools else None
+            
+            # Create messages for the provider
+            messages = []
+            
+            # Add system messages
+            for system_msg in combined_system:
+                if system_msg.strip():
+                    messages.append(ProviderChatMessage(role="system", content=system_msg))
+            
+            # Add user message
+            messages.append(ProviderChatMessage(role="user", content=request.message_content))
+            
+            # Get provider and send request
+            provider = ProviderManager.get(request.provider_id)
+            if not provider:
+                raise Exception(f"Provider {request.provider_id} not found")
+            
+            if not await provider.is_authenticated():
+                raise Exception(f"Not authenticated with {request.provider_id}")
+            
+            # Create chat request
+            chat_request = ChatRequest(
+                messages=messages,
+                model=request.model_id,
+                max_tokens=4096,
+                tools=tools_spec
+            )
+            
+            # Send to provider
+            response = await provider.chat(chat_request)
+            
+            # Handle tool calls if present
+            if response.tool_calls:
+                tool_results = await cls._execute_tool_calls(
+                    response.tool_calls,
+                    request.session_id,
+                    "temp-message-id"  # TODO: Use proper message ID
+                )
+                
+                # Add tool results to response
+                response.content += "\n\n" + "\n".join(tool_results)
+            
+            return SessionChatResponse(
+                content=response.content,
+                tool_calls=response.tool_calls,
+                usage=response.usage
+            )
+            
+        except Exception as e:
+            cls._log.error("Chat error", {"error": str(e)})
+            return SessionChatResponse(
+                content=f"Error: {str(e)}",
+                tool_calls=[],
+                usage=None
+            )
+    
+    @classmethod
+    async def _execute_tool_calls(
+        cls,
+        tool_calls: List[Dict[str, Any]],
+        session_id: str,
+        message_id: str
+    ) -> List[str]:
+        """Execute tool calls and return results."""
+        results = []
         
-        return ChatResponse(parts=[response_part])
+        for tool_call in tool_calls:
+            try:
+                function_name = tool_call.get("function", {}).get("name", "")
+                arguments_str = tool_call.get("function", {}).get("arguments", "{}")
+                
+                # Parse arguments
+                try:
+                    arguments = json.loads(arguments_str) if isinstance(arguments_str, str) else arguments_str
+                except json.JSONDecodeError:
+                    arguments = {}
+                
+                # Create tool context
+                abort_event = asyncio.Event()
+                context = ToolContext(
+                    session_id=session_id,
+                    message_id=message_id,
+                    abort_event=abort_event,
+                    metadata_callback=lambda x: None  # TODO: Implement metadata handling
+                )
+                
+                # Execute tool
+                result = await ToolRegistry.execute_tool(function_name, arguments, context)
+                results.append(f"[{function_name}] {result.output}")
+                
+            except Exception as e:
+                results.append(f"[{function_name}] Error: {str(e)}")
+        
+        return results
     
     @classmethod
     async def share(cls, session_id: str) -> str:

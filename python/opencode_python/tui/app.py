@@ -21,13 +21,10 @@ from ..app import App as OpenCodeApp
 from ..provider import ProviderManager, OpenAIProvider, AnthropicProvider, GitHubCopilotProvider
 from ..provider.provider import ChatRequest, ChatMessage as ProviderChatMessage
 from ..session import Session, Mode
+from ..session.session import SessionChatRequest
 from ..config import Config
 from ..util.log import Log as Logger
-from ..tools import (
-    BashTool, EditTool, GlobTool, GrepTool, ListTool,
-    LSPDiagnosticsTool, LSPHoverTool, MultiEditTool, PatchTool,
-    ReadTool, TaskTool, TodoReadTool, TodoWriteTool, WebFetchTool, WriteTool
-)
+from ..tools import ToolRegistry
 
 
 class ChatMessageWidget(Static):
@@ -441,26 +438,17 @@ class OpenCodeTUI(App):
             if not await provider.is_authenticated():
                 raise Exception(f"Not authenticated with {model_selector.selected_provider}")
             
-            # Get current mode and tools
-            current_mode = await Mode.get("default")  # TODO: Make this configurable
-            
-            # Register available tools
-            available_tools = self._get_available_tools(current_mode.tools)
-            
-            # Create chat request with tools
-            request = ChatRequest(
-                messages=[ProviderChatMessage(role="user", content=message)],
-                model=model_selector.selected_model,
-                max_tokens=4096,
-                tools=available_tools if available_tools else None
+            # Create session chat request with integrated system prompts and tools
+            session_request = SessionChatRequest(
+                session_id=self.current_session.id if self.current_session else "temp-session",
+                provider_id=model_selector.selected_provider,
+                model_id=model_selector.selected_model,
+                mode="default",  # TODO: Make this configurable
+                message_content=message
             )
             
-            # Send request
-            response = await provider.chat(request)
-            
-            # Handle tool calls if present
-            if response.tool_calls:
-                await self._handle_tool_calls(response.tool_calls, chat_panel)
+            # Send request through session system (includes system prompts and tool integration)
+            response = await Session.chat(session_request)
             
             # Add assistant response
             if response.content:
@@ -530,6 +518,14 @@ The AI has access to these tools:
 - **edit**: Edit files
 - **grep**: Search in files
 - **ls**: List directory contents
+- **multiedit**: Multi-file editing
+- **patch**: Apply patches
+- **task**: Task management
+- **todo**: Todo management
+- **webfetch**: Web content fetching
+- **lsp**: Language server integration
+
+Tools are automatically integrated with system prompts and context.
 
 ## Authentication
 Make sure you're authenticated with your chosen provider:
@@ -559,83 +555,6 @@ Make sure you're authenticated with your chosen provider:
             session_info = self.query_one("#session-info", Static)
             session_info.update("Session: Error")
     
-    def _get_available_tools(self, tool_names: list) -> list:
-        """Get available tools based on mode configuration."""
-        tool_registry = {
-            "bash": BashTool(),
-            "edit": EditTool(),
-            "glob": GlobTool(),
-            "grep": GrepTool(),
-            "ls": ListTool(),
-            "lsp_diagnostics": LSPDiagnosticsTool(),
-            "lsp_hover": LSPHoverTool(),
-            "multiedit": MultiEditTool(),
-            "patch": PatchTool(),
-            "read": ReadTool(),
-            "task": TaskTool(),
-            "todo_read": TodoReadTool(),
-            "todo_write": TodoWriteTool(),
-            "webfetch": WebFetchTool(),
-            "write": WriteTool(),
-        }
-        
-        tools = []
-        for tool_name in tool_names:
-            if tool_name in tool_registry:
-                tool = tool_registry[tool_name]
-                # Convert tool to OpenAI function format
-                tool_spec = {
-                    "type": "function",
-                    "function": {
-                        "name": tool.id,
-                        "description": tool.description,
-                        "parameters": self._get_tool_parameters(tool)
-                    }
-                }
-                tools.append(tool_spec)
-        
-        return tools
-    
-    def _get_tool_parameters(self, tool) -> dict:
-        """Convert tool parameters to JSON schema format."""
-        # This is a simplified version - in a full implementation,
-        # you'd convert the Pydantic model to JSON schema
-        if hasattr(tool, 'parameters'):
-            # For now, return a basic schema
-            return {
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
-        return {"type": "object", "properties": {}}
-    
-    async def _handle_tool_calls(self, tool_calls: list, chat_panel) -> str:
-        """Handle tool calls from the AI response."""
-        tool_results = []
-        
-        for tool_call in tool_calls:
-            try:
-                function_name = tool_call.get("function", {}).get("name", "")
-                arguments = tool_call.get("function", {}).get("arguments", "{}")
-                
-                # Show tool execution in chat
-                chat_panel.add_message("system", f"[TOOL] Executing: {function_name}")
-                await self._update_status(f"Executing {function_name}...")
-                
-                # TODO: Actually execute the tool
-                # For now, just simulate tool execution
-                result = f"Tool {function_name} executed successfully"
-                tool_results.append(result)
-                
-                # Show result in chat
-                chat_panel.add_message("system", f"[RESULT] {result}")
-                
-            except Exception as e:
-                error_msg = f"[ERROR] Tool execution failed: {str(e)}"
-                chat_panel.add_message("system", error_msg)
-                tool_results.append(error_msg)
-        
-        return "\n".join(tool_results)
     
     async def _update_status(self, message: str) -> None:
         """Update status message."""
