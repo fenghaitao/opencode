@@ -123,7 +123,7 @@ class ProviderManager:
                     return provider.id, info.models[0].id
         
         # Default fallback
-        return "openai", "gpt-4"
+        return "github-copilot", "gpt-4.1"
     
     @classmethod
     def parse_model(cls, model_string: str) -> Tuple[str, str]:

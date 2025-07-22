@@ -15,8 +15,8 @@ class ConfigModel(BaseModel):
     
     log_level: Optional[LogLevel] = None
     autoshare: bool = False
-    default_provider: Optional[str] = None
-    default_model: Optional[str] = None
+    default_provider: Optional[str] = "github-copilot"
+    default_model: Optional[str] = "gpt-4.1"
     providers: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     tools: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     modes: Dict[str, Dict[str, Any]] = Field(default_factory=dict)

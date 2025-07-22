@@ -56,7 +56,7 @@ dev = [
 ]
 
 [project.scripts]
-opencode = "opencode_python.cli:main"
+opencode = "opencode_python.cli:cli_main"
 
 [project.urls]
 Homepage = "https://opencode.ai"

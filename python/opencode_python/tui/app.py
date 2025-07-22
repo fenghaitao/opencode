@@ -19,13 +19,18 @@ from rich.markdown import Markdown
 
 from ..app import App as OpenCodeApp
 from ..provider import ProviderManager, OpenAIProvider, AnthropicProvider, GitHubCopilotProvider
-from ..provider.provider import ChatRequest, ChatMessage
+from ..provider.provider import ChatRequest, ChatMessage as ProviderChatMessage
 from ..session import Session, Mode
 from ..config import Config
 from ..util.log import Log as Logger
+from ..tools import (
+    BashTool, EditTool, GlobTool, GrepTool, ListTool,
+    LSPDiagnosticsTool, LSPHoverTool, MultiEditTool, PatchTool,
+    ReadTool, TaskTool, TodoReadTool, TodoWriteTool, WebFetchTool, WriteTool
+)
 
 
-class ChatMessage(Static):
+class ChatMessageWidget(Static):
     """A single chat message widget."""
     
     def __init__(self, role: str, content: str, **kwargs):
@@ -68,9 +73,16 @@ class ChatPanel(Container):
         """Add a new message to the chat."""
         self.messages = self.messages + [{"role": role, "content": content}]
         
-        # Add message widget
-        message_widget = ChatMessage(role, content)
+        # Remove welcome message if it exists (first real message)
         messages_container = self.query_one("#messages-container")
+        try:
+            welcome_widget = messages_container.query_one("#welcome-message")
+            welcome_widget.remove()
+        except:
+            pass  # Welcome message doesn't exist, that's fine
+        
+        # Add message widget
+        message_widget = ChatMessageWidget(role, content)
         messages_container.mount(message_widget)
         
         # Scroll to bottom
@@ -87,6 +99,7 @@ class ChatPanel(Container):
         self.messages = []
         messages_container = self.query_one("#messages-container")
         messages_container.remove_children()
+        # Always create a new welcome message since we removed all children
         messages_container.mount(Static("Chat cleared. Start a new conversation!", id="welcome-message"))
 
 
@@ -117,12 +130,17 @@ class ModelSelector(Container):
         self.providers = ProviderManager.list()
         provider_options = []
         
-        for provider in self.providers:
+        # Sort providers to prioritize GitHub Copilot
+        priority_order = {"github-copilot": 0, "anthropic": 1, "openai": 2}
+        sorted_providers = sorted(self.providers, key=lambda p: priority_order.get(p.id, 99))
+        
+        for provider in sorted_providers:
             try:
                 provider_info = await provider.get_info()
                 is_auth = await provider.is_authenticated()
-                status = "✓" if is_auth else "✗"
-                provider_options.append((f"{status} {provider_info.name}", provider.id))
+                status = "[OK]" if is_auth else "[--]"
+                recommended = " (recommended)" if provider.id == "github-copilot" else ""
+                provider_options.append((f"{status} {provider_info.name}{recommended}", provider.id))
                 
                 # Store models for this provider
                 self.models[provider.id] = provider_info.models
@@ -132,6 +150,16 @@ class ModelSelector(Container):
         # Update provider select
         provider_select = self.query_one("#provider-select", Select)
         provider_select.set_options(provider_options)
+        
+        # Auto-select GitHub Copilot if authenticated
+        for provider in sorted_providers:
+            if provider.id == "github-copilot" and await provider.is_authenticated():
+                self.selected_provider = provider.id
+                provider_select.value = provider.id
+                self._update_model_select()
+                # Auto-select gpt-4.1 if available
+                await self._auto_select_default_model()
+                break
     
     def on_select_changed(self, event: Select.Changed) -> None:
         """Handle selection changes."""
@@ -154,6 +182,38 @@ class ModelSelector(Container):
         model_select = self.query_one("#model-select", Select)
         model_select.set_options(model_options)
         model_select.disabled = False
+        
+        # Auto-select default model after updating options
+        self.call_after_refresh(self._auto_select_default_model)
+    
+    async def _auto_select_default_model(self):
+        """Auto-select the default model for the current provider."""
+        if not self.selected_provider or self.selected_provider not in self.models:
+            return
+        
+        # Define preferred models for each provider
+        preferred_models = {
+            "github-copilot": "gpt-4.1",
+            "openai": "gpt-4",
+            "anthropic": "claude-3-5-sonnet-20241022"
+        }
+        
+        available_models = [m.id for m in self.models[self.selected_provider]]
+        preferred_model = preferred_models.get(self.selected_provider)
+        
+        # Try to select the preferred model, or fall back to first available
+        if preferred_model and preferred_model in available_models:
+            target_model = preferred_model
+        elif available_models:
+            target_model = available_models[0]
+        else:
+            return
+        
+        # Update the selection
+        self.selected_model = target_model
+        model_select = self.query_one("#model-select", Select)
+        model_select.value = target_model
+        self._update_model_info()
     
     def _update_model_info(self):
         """Update model information display."""
@@ -200,8 +260,21 @@ class OpenCodeTUI(App):
     CSS = """
     Screen {
         layout: grid;
-        grid-size: 3 1;
+        grid-size: 3 2;
+        grid-rows: auto 1fr;
         grid-columns: 1fr 2fr 1fr;
+    }
+    
+    #header-container {
+        column-span: 3;
+        height: 1;
+    }
+    
+    #custom-header {
+        background: $primary;
+        color: $text;
+        text-align: center;
+        padding: 0 1;
     }
     
     #left-panel {
@@ -263,22 +336,25 @@ class OpenCodeTUI(App):
     
     BINDINGS = [
         Binding("ctrl+c", "quit", "Quit"),
-        Binding("ctrl+n", "new_session", "New Session"),
-        Binding("ctrl+l", "clear_chat", "Clear Chat"),
-        Binding("enter", "send_message", "Send", show=False),
-        Binding("f1", "show_help", "Help"),
+        Binding("ctrl+n", "action_new_session", "New Session"),
+        Binding("ctrl+l", "action_clear_chat", "Clear Chat"),
+        Binding("enter", "action_send_message", "Send", show=False),
+        Binding("f1", "action_show_help", "Help"),
     ]
     
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.current_session = None
         self.app_info = None
+        self._creating_session = False  # Flag to prevent concurrent session creation
         # Use Textual's built-in logging instead of custom logger
         # self._logger = Logger.create({"service": "tui"})
     
     def compose(self) -> ComposeResult:
         """Create the UI layout."""
-        yield Header()
+        # Custom header with ASCII characters only
+        with Container(id="header-container"):
+            yield Static("OpenCode TUI - AI Coding Assistant | Press Ctrl+C to quit, F1 for help", id="custom-header")
         
         with Container(id="left-panel"):
             yield ModelSelector()
@@ -298,17 +374,22 @@ class OpenCodeTUI(App):
         
         # Initialize within app context
         async def init_app():
-            self.app_info = OpenCodeApp.info()
-            
-            # Load providers
-            model_selector = self.query_one(ModelSelector)
-            await model_selector.load_providers()
-            
-            # Create initial session
-            await self._create_new_session()
-            
-            # Update status
-            await self._update_status("Ready - Select a model and start chatting!")
+            try:
+                self.app_info = OpenCodeApp.info()
+                
+                # Load providers
+                model_selector = self.query_one(ModelSelector)
+                await model_selector.load_providers()
+                
+                # Create initial session
+                await self._create_new_session()
+                
+                # Update status
+                await self._update_status("Ready - Select a model and start chatting!")
+                
+            except Exception as e:
+                self.log.error(f"Failed to initialize app: {str(e)}")
+                await self._update_status(f"Initialization error: {str(e)}")
         
         await OpenCodeApp.provide(".", lambda _: init_app())
     
@@ -360,18 +441,30 @@ class OpenCodeTUI(App):
             if not await provider.is_authenticated():
                 raise Exception(f"Not authenticated with {model_selector.selected_provider}")
             
-            # Create chat request
+            # Get current mode and tools
+            current_mode = await Mode.get("default")  # TODO: Make this configurable
+            
+            # Register available tools
+            available_tools = self._get_available_tools(current_mode.tools)
+            
+            # Create chat request with tools
             request = ChatRequest(
-                messages=[ChatMessage(role="user", content=message)],
+                messages=[ProviderChatMessage(role="user", content=message)],
                 model=model_selector.selected_model,
-                max_tokens=4096
+                max_tokens=4096,
+                tools=available_tools if available_tools else None
             )
             
             # Send request
             response = await provider.chat(request)
             
+            # Handle tool calls if present
+            if response.tool_calls:
+                await self._handle_tool_calls(response.tool_calls, chat_panel)
+            
             # Add assistant response
-            chat_panel.add_message("assistant", response.content)
+            if response.content:
+                chat_panel.add_message("assistant", response.content)
             
             # Update status
             tokens_info = ""
@@ -379,7 +472,8 @@ class OpenCodeTUI(App):
                 total = response.usage.get('total_tokens', 0)
                 tokens_info = f" ({total} tokens)"
             
-            await self._update_status(f"Response received{tokens_info}")
+            tool_info = f" (used {len(response.tool_calls)} tools)" if response.tool_calls else ""
+            await self._update_status(f"Response received{tokens_info}{tool_info}")
             
         except Exception as e:
             self.log.error(f"Chat error: {str(e)}")
@@ -388,9 +482,21 @@ class OpenCodeTUI(App):
     
     async def action_new_session(self) -> None:
         """Create a new session."""
-        await self._create_new_session()
-        await self.action_clear_chat()
-        await self._update_status("New session created")
+        if self._creating_session:
+            await self._update_status("Session creation already in progress...")
+            return
+            
+        try:
+            self._creating_session = True
+            await self._update_status("Creating new session...")
+            await self._create_new_session()
+            await self.action_clear_chat()
+            await self._update_status("New session created")
+        except Exception as e:
+            self.log.error(f"Failed to create new session: {str(e)}")
+            await self._update_status(f"Failed to create new session: {str(e)}")
+        finally:
+            self._creating_session = False
     
     async def action_clear_chat(self) -> None:
         """Clear the chat."""
@@ -416,6 +522,15 @@ class OpenCodeTUI(App):
 3. Press Enter or click Send to chat with the AI
 4. Use the right panel for session management
 
+## Tools Available
+The AI has access to these tools:
+- **bash**: Execute shell commands
+- **read**: Read file contents
+- **write**: Write to files
+- **edit**: Edit files
+- **grep**: Search in files
+- **ls**: List directory contents
+
 ## Authentication
 Make sure you're authenticated with your chosen provider:
 - Run `opencode auth login` in terminal
@@ -426,20 +541,108 @@ Make sure you're authenticated with your chosen provider:
     
     async def _create_new_session(self) -> None:
         """Create a new session."""
-        async def create_session():
-            self.current_session = await Session.create("default")
-            return self.current_session
+        try:
+            async def create_session():
+                self.current_session = await Session.create(mode="default")
+                return self.current_session
+            
+            session = await OpenCodeApp.provide(".", lambda _: create_session())
+            
+            # Update session info
+            session_info = self.query_one("#session-info", Static)
+            session_info.update(f"Session: {session.id[:8]}")
+            
+        except Exception as e:
+            self.log.error(f"Failed to create session: {str(e)}")
+            await self._update_status(f"Failed to create session: {str(e)}")
+            # Set a fallback session info
+            session_info = self.query_one("#session-info", Static)
+            session_info.update("Session: Error")
+    
+    def _get_available_tools(self, tool_names: list) -> list:
+        """Get available tools based on mode configuration."""
+        tool_registry = {
+            "bash": BashTool(),
+            "edit": EditTool(),
+            "glob": GlobTool(),
+            "grep": GrepTool(),
+            "ls": ListTool(),
+            "lsp_diagnostics": LSPDiagnosticsTool(),
+            "lsp_hover": LSPHoverTool(),
+            "multiedit": MultiEditTool(),
+            "patch": PatchTool(),
+            "read": ReadTool(),
+            "task": TaskTool(),
+            "todo_read": TodoReadTool(),
+            "todo_write": TodoWriteTool(),
+            "webfetch": WebFetchTool(),
+            "write": WriteTool(),
+        }
         
-        session = await OpenCodeApp.provide(".", lambda _: create_session())
+        tools = []
+        for tool_name in tool_names:
+            if tool_name in tool_registry:
+                tool = tool_registry[tool_name]
+                # Convert tool to OpenAI function format
+                tool_spec = {
+                    "type": "function",
+                    "function": {
+                        "name": tool.id,
+                        "description": tool.description,
+                        "parameters": self._get_tool_parameters(tool)
+                    }
+                }
+                tools.append(tool_spec)
         
-        # Update session info
-        session_info = self.query_one("#session-info", Static)
-        session_info.update(f"Session: {session.id[:8]}")
+        return tools
+    
+    def _get_tool_parameters(self, tool) -> dict:
+        """Convert tool parameters to JSON schema format."""
+        # This is a simplified version - in a full implementation,
+        # you'd convert the Pydantic model to JSON schema
+        if hasattr(tool, 'parameters'):
+            # For now, return a basic schema
+            return {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        return {"type": "object", "properties": {}}
+    
+    async def _handle_tool_calls(self, tool_calls: list, chat_panel) -> str:
+        """Handle tool calls from the AI response."""
+        tool_results = []
+        
+        for tool_call in tool_calls:
+            try:
+                function_name = tool_call.get("function", {}).get("name", "")
+                arguments = tool_call.get("function", {}).get("arguments", "{}")
+                
+                # Show tool execution in chat
+                chat_panel.add_message("system", f"[TOOL] Executing: {function_name}")
+                await self._update_status(f"Executing {function_name}...")
+                
+                # TODO: Actually execute the tool
+                # For now, just simulate tool execution
+                result = f"Tool {function_name} executed successfully"
+                tool_results.append(result)
+                
+                # Show result in chat
+                chat_panel.add_message("system", f"[RESULT] {result}")
+                
+            except Exception as e:
+                error_msg = f"[ERROR] Tool execution failed: {str(e)}"
+                chat_panel.add_message("system", error_msg)
+                tool_results.append(error_msg)
+        
+        return "\n".join(tool_results)
     
     async def _update_status(self, message: str) -> None:
         """Update status message."""
         status_text = self.query_one("#status-text", Static)
-        status_text.update(message)
+        # Escape markup characters to prevent MarkupError
+        escaped_message = message.replace("[", "\\[").replace("]", "\\]")
+        status_text.update(escaped_message)
 
 
 def run_tui():

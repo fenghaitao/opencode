@@ -28,7 +28,8 @@ except ImportError:
 app = typer.Typer(
     name="opencode",
     help="AI coding agent, built for the terminal",
-    no_args_is_help=True
+    no_args_is_help=False,
+    invoke_without_command=True
 )
 
 console = Console()
@@ -133,7 +134,7 @@ async def _run_async(
             provider_id, model_id = model.split("/", 1) if "/" in model else ("openai", model)
         else:
             # Use default model
-            provider_id, model_id = "openai", "gpt-4"
+            provider_id, model_id = "github-copilot", "gpt-4.1"
         
         console.print(f"[bold]@ {provider_id}/{model_id}[/bold]")
         console.print()
@@ -908,8 +909,26 @@ async def _tui_async(model: Optional[str], mode: Optional[str], project: Optiona
     await App.provide(".", tui_with_app)
 
 
-def main():
-    """Main entry point."""
+@app.callback()
+def main_callback(ctx: typer.Context):
+    """Main callback for handling no-command invocation."""
+    if ctx.invoked_subcommand is None:
+        # No subcommand provided, launch TUI
+        if not TUI_AVAILABLE:
+            console.print("[red]TUI not available[/red]")
+            console.print("Install textual with: [cyan]pip install textual[/cyan]")
+            console.print()
+            console.print("Or use a specific command:")
+            console.print("  [cyan]opencode run 'your message'[/cyan]")
+            console.print("  [cyan]opencode --help[/cyan]")
+            return
+        
+        # Launch TUI with default settings
+        asyncio.run(_tui_async(None, None, None))
+
+
+def cli_main():
+    """CLI entry point wrapper."""
     try:
         app()
     except KeyboardInterrupt:
@@ -921,4 +940,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    cli_main()
