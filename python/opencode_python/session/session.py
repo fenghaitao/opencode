@@ -390,12 +390,66 @@ class Session:
                 # Check if provider supports streaming
                 if hasattr(provider, 'chat_streaming'):
                     # Use streaming if available
+                    accumulated_tool_calls = []
+                    last_tool_calls_hash = None
+                    
                     async for chunk in provider.chat_streaming(chat_request):
                         if chunk.get("type") == "content":
                             streaming_response.add_chunk("content", chunk.get("content", ""))
                         elif chunk.get("type") == "tool_calls":
-                            streaming_response.tool_calls = chunk.get("tool_calls", [])
-                            streaming_response.add_chunk("tool_calls", tool_calls=chunk.get("tool_calls", []))
+                            tool_calls_chunk = chunk.get("tool_calls", [])
+                            
+                            # Aggregate tool call chunks properly
+                            for tool_call_chunk in tool_calls_chunk:
+                                if tool_call_chunk.get("index") is not None:
+                                    index = tool_call_chunk["index"]
+                                    
+                                    # Ensure we have enough slots
+                                    while len(accumulated_tool_calls) <= index:
+                                        accumulated_tool_calls.append({"id": None, "type": "function", "function": {"name": "", "arguments": ""}})
+                                    
+                                    # Update the specific tool call
+                                    tool_call = accumulated_tool_calls[index]
+                                    
+                                    # Update ID
+                                    if tool_call_chunk.get("id"):
+                                        tool_call["id"] = tool_call_chunk["id"]
+                                    
+                                    # Update function name
+                                    if tool_call_chunk.get("function", {}).get("name"):
+                                        tool_call["function"]["name"] = tool_call_chunk["function"]["name"]
+                                    
+                                    # Append arguments (streaming chunks)
+                                    if tool_call_chunk.get("function", {}).get("arguments"):
+                                        tool_call["function"]["arguments"] += tool_call_chunk["function"]["arguments"]
+                            
+                            # Check if we have complete tool calls and only emit when they change
+                            complete_tool_calls = [tc for tc in accumulated_tool_calls if tc["id"] and tc["function"]["name"] and tc["function"]["arguments"]]
+                            
+                            # Only emit when we have complete tool calls that have changed
+                            if complete_tool_calls:
+                                try:
+                                    # Try to parse the arguments to ensure they're complete JSON
+                                    for tc in complete_tool_calls:
+                                        json.loads(tc["function"]["arguments"])
+                                    
+                                    # Only emit if this is different from last emission
+                                    current_hash = str(complete_tool_calls)
+                                    if current_hash != last_tool_calls_hash:
+                                        streaming_response.tool_calls = complete_tool_calls
+                                        streaming_response.add_chunk("tool_calls", tool_calls=complete_tool_calls)
+                                        last_tool_calls_hash = current_hash
+                                        
+                                        # Once we have complete tool calls, execute them
+                                        await cls._execute_tool_calls_streaming(
+                                            complete_tool_calls,
+                                            request.session_id,
+                                            "temp-message-id",
+                                            streaming_response
+                                        )
+                                except json.JSONDecodeError:
+                                    # Arguments not complete yet, wait for more chunks
+                                    pass
                         elif chunk.get("type") == "complete":
                             streaming_response.complete(chunk.get("usage"))
                             break

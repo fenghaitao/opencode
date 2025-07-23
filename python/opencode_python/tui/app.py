@@ -39,14 +39,20 @@ class ChatMessageWidget(Static):
         role_style = "bold blue" if self.role == "user" else "bold green"
         yield Static(f"[{role_style}]{self.role.upper()}[/{role_style}]", classes="message-role")
         
-        # Render markdown content
-        if self.content.strip():
-            try:
-                markdown = Markdown(self.content)
-                yield Static(markdown, classes="message-content")
-            except Exception:
-                # Fallback to plain text if markdown fails
-                yield Static(self.content, classes="message-content")
+        # Store reference to content widget for streaming updates
+        self.content_widget = Static(self.content, classes="message-content")
+        yield self.content_widget
+    
+    def update_content(self, new_content: str):
+        """Update the content of this message widget (for streaming)."""
+        self.content = new_content
+        try:
+            # Try to render as markdown, fallback to plain text
+            markdown = Markdown(new_content)
+            self.content_widget.update(markdown)
+        except Exception:
+            # Fallback to plain text
+            self.content_widget.update(new_content)
 
 
 class ChatPanel(Container):
@@ -596,18 +602,6 @@ Make sure you're authenticated with your chosen provider:
                 content = chunk.get("content", "")
 
                 self.log.debug(f"Processing chunk {chunk_count}: type={chunk_type}, content_len={len(content)}")
-
-                if chunk_type == "error":
-                    error_msg = chunk.get("content", "Unknown error")
-                    self.log.error(f"Streaming error: {error_msg}")
-                    await self._update_status(f"Error: {error_msg}")
-                    break
-                chunk_count += 1
-                chunk_type = chunk.get("type", "")
-                content = chunk.get("content", "")
-                
-                # Log chunk processing
-                self.log.debug(f"Processing chunk {chunk_count}: {chunk_type} - content_len={len(content)}")
                 
                 if chunk_type == "content":
                     total_content += content
@@ -616,18 +610,12 @@ Make sure you're authenticated with your chosen provider:
                     if current_message_widget is None:
                         # Create new assistant message widget
                         self.log.debug("Creating new assistant message widget")
-                        current_message_widget = ChatMessageWidget("assistant", content)
+                        current_message_widget = ChatMessageWidget("assistant", total_content)
                         messages_container = chat_panel.query_one("#messages-container")
                         messages_container.mount(current_message_widget)
                     else:
-                        # Update existing message content
-                        current_message_widget.content += content
-
-                        # Force refresh the widget
-                        try:
-                            current_message_widget.refresh()
-                        except Exception as refresh_error:
-                            self.log.error(f"Widget refresh failed: {refresh_error}")
+                        # Update existing message content using the new method
+                        current_message_widget.update_content(total_content)
 
                     # Scroll to bottom
                     try:
@@ -653,6 +641,7 @@ Make sure you're authenticated with your chosen provider:
                 elif chunk_type == "error":
                     chat_panel.add_message("system", f"Error: {content}")
                     await self._update_status(f"Error: {content}")
+                    break
                 
                 elif chunk_type == "complete":
                     # Final status update
