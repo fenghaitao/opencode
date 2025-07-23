@@ -162,7 +162,99 @@ class OpenAIProvider(Provider):
         
         except Exception as e:
             raise RuntimeError(f"OpenAI API error: {e}")
-    
+
+    async def chat_streaming(self, request: ChatRequest):
+        """Send streaming chat request to OpenAI."""
+        client = await self._get_client()
+
+        # Convert messages
+        messages = []
+        for msg in request.messages:
+            messages.append({
+                "role": msg.role,
+                "content": msg.content
+            })
+
+        # Prepare request parameters
+        kwargs = {
+            "model": request.model,
+            "messages": messages,
+            "stream": True
+        }
+
+        if request.max_tokens:
+            kwargs["max_tokens"] = request.max_tokens
+
+        if request.temperature is not None:
+            kwargs["temperature"] = request.temperature
+
+        if request.tools:
+            kwargs["tools"] = request.tools
+
+        try:
+            response = await client.chat.completions.create(**kwargs)
+
+            content = ""
+            tool_calls = []
+
+            async for chunk in response:
+                if chunk.choices:
+                    choice = chunk.choices[0]
+                    delta = choice.delta
+
+                    # Handle content
+                    if delta.content:
+                        content += delta.content
+                        yield {
+                            "type": "content",
+                            "content": delta.content
+                        }
+
+                    # Handle tool calls
+                    if delta.tool_calls:
+                        for tool_call in delta.tool_calls:
+                            if tool_call.function:
+                                tool_calls.append({
+                                    "id": tool_call.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tool_call.function.name,
+                                        "arguments": tool_call.function.arguments,
+                                    }
+                                })
+
+                    # Handle completion
+                    if choice.finish_reason:
+                        # Send tool calls if any
+                        if tool_calls:
+                            yield {
+                                "type": "tool_calls",
+                                "tool_calls": tool_calls
+                            }
+
+                        # Send completion
+                        usage = getattr(chunk, 'usage', None)
+                        usage_dict = None
+                        if usage:
+                            usage_dict = {
+                                "prompt_tokens": usage.prompt_tokens,
+                                "completion_tokens": usage.completion_tokens,
+                                "total_tokens": usage.total_tokens
+                            }
+
+                        yield {
+                            "type": "complete",
+                            "usage": usage_dict,
+                            "finish_reason": choice.finish_reason
+                        }
+                        break
+
+        except Exception as e:
+            yield {
+                "type": "error",
+                "content": f"OpenAI streaming error: {str(e)}"
+            }
+
     async def is_authenticated(self) -> bool:
         """Check if OpenAI is authenticated."""
         try:

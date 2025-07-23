@@ -586,68 +586,54 @@ Make sure you're authenticated with your chosen provider:
         tool_count = 0
         total_content = ""
         chunk_count = 0
-        
+
         try:
-            print("DEBUG: Starting async for loop over streaming_response")
-            chunk_iterator = streaming_response.__aiter__()
-            
-            while True:
-                try:
-                    chunk = await chunk_iterator.__anext__()
-                except StopAsyncIteration:
-                    print("DEBUG: StopAsyncIteration - streaming completed normally")
-                    break
-                except Exception as iter_error:
-                    print(f"DEBUG: Exception in async iteration: {iter_error}")
-                    import traceback
-                    traceback.print_exc()
+            self.log.info("Starting streaming response handling")
+
+            async for chunk in streaming_response:
+                chunk_count += 1
+                chunk_type = chunk.get("type", "")
+                content = chunk.get("content", "")
+
+                self.log.debug(f"Processing chunk {chunk_count}: type={chunk_type}, content_len={len(content)}")
+
+                if chunk_type == "error":
+                    error_msg = chunk.get("content", "Unknown error")
+                    self.log.error(f"Streaming error: {error_msg}")
+                    await self._update_status(f"Error: {error_msg}")
                     break
                 chunk_count += 1
                 chunk_type = chunk.get("type", "")
                 content = chunk.get("content", "")
                 
-                # Detailed chunk debugging
-                print(f"DEBUG: Processing chunk {chunk_count}")
-                print(f"DEBUG: Chunk type: {chunk_type}")
-                print(f"DEBUG: Chunk content: '{content}' (len={len(content)})")
-                print(f"DEBUG: Full chunk: {chunk}")
-                
-                # Debug logging (both log and print for visibility)
-                debug_msg = f"TUI chunk {chunk_count}: {chunk_type} - '{content}' (len={len(content)})"
-                self.log.info(debug_msg)
-                print(f"DEBUG: {debug_msg}")  # Also print to console
+                # Log chunk processing
+                self.log.debug(f"Processing chunk {chunk_count}: {chunk_type} - content_len={len(content)}")
                 
                 if chunk_type == "content":
                     total_content += content
-                    debug_msg = f"TUI accumulated: '{total_content}' (total len={len(total_content)})"
-                    self.log.info(debug_msg)
-                    print(f"DEBUG: {debug_msg}")
-                    
+
                     # Stream content to the chat
                     if current_message_widget is None:
                         # Create new assistant message widget
-                        self.log.info("TUI: Creating new ChatMessageWidget")
+                        self.log.debug("Creating new assistant message widget")
                         current_message_widget = ChatMessageWidget("assistant", content)
                         messages_container = chat_panel.query_one("#messages-container")
                         messages_container.mount(current_message_widget)
                     else:
                         # Update existing message content
-                        old_content = current_message_widget.content
                         current_message_widget.content += content
-                        self.log.info(f"TUI widget update: '{old_content}' -> '{current_message_widget.content}'")
-                        
+
                         # Force refresh the widget
                         try:
                             current_message_widget.refresh()
-                            self.log.info("TUI: Widget refresh successful")
                         except Exception as refresh_error:
-                            self.log.error(f"TUI: Widget refresh failed: {refresh_error}")
-                    
+                            self.log.error(f"Widget refresh failed: {refresh_error}")
+
                     # Scroll to bottom
                     try:
                         chat_panel.call_after_refresh(chat_panel._scroll_to_bottom)
                     except Exception as scroll_error:
-                        self.log.error(f"TUI: Scroll failed: {scroll_error}")
+                        self.log.error(f"Scroll failed: {scroll_error}")
                 
                 elif chunk_type == "status":
                     await self._update_status(content)
@@ -688,20 +674,12 @@ Make sure you're authenticated with your chosen provider:
             await self._update_status(f"Streaming error: {str(e)}")
         
         finally:
-            # Debug final state
-            print(f"DEBUG: TUI streaming complete - Total chunks: {chunk_count}")
-            print(f"DEBUG: TUI final accumulated content: '{total_content}' (len={len(total_content)})")
+            # Log final state
+            self.log.info(f"Streaming complete - Total chunks: {chunk_count}, content length: {len(total_content)}")
             if current_message_widget:
-                print(f"DEBUG: TUI final widget content: '{current_message_widget.content}' (len={len(current_message_widget.content)})")
+                self.log.debug(f"Final widget content length: {len(current_message_widget.content)}")
             else:
-                print("DEBUG: TUI: No message widget was created!")
-            
-            self.log.info(f"TUI streaming complete - Total chunks: {chunk_count}")
-            self.log.info(f"TUI final accumulated content: '{total_content}' (len={len(total_content)})")
-            if current_message_widget:
-                self.log.info(f"TUI final widget content: '{current_message_widget.content}' (len={len(current_message_widget.content)})")
-            else:
-                self.log.error("TUI: No message widget was created!")
+                self.log.warning("No message widget was created during streaming")
     
     async def _update_status(self, message: str) -> None:
         """Update status message."""

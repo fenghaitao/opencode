@@ -172,7 +172,91 @@ class AnthropicProvider(Provider):
         
         except Exception as e:
             raise RuntimeError(f"Anthropic API error: {e}")
-    
+
+    async def chat_streaming(self, request: ChatRequest):
+        """Send streaming chat request to Anthropic."""
+        client = await self._get_client()
+
+        # Convert messages to Anthropic format
+        messages = []
+        for msg in request.messages:
+            if msg.role == "system":
+                # System messages are handled separately in Anthropic
+                continue
+            messages.append({
+                "role": msg.role,
+                "content": msg.content
+            })
+
+        # Prepare request parameters
+        kwargs = {
+            "model": request.model,
+            "messages": messages,
+            "max_tokens": request.max_tokens or 4096,
+            "stream": True
+        }
+
+        # Add system message if present
+        system_messages = [msg.content for msg in request.messages if msg.role == "system"]
+        if system_messages:
+            kwargs["system"] = "\n\n".join(system_messages)
+
+        if request.temperature is not None:
+            kwargs["temperature"] = request.temperature
+
+        if request.tools:
+            kwargs["tools"] = request.tools
+
+        try:
+            response = await client.messages.create(**kwargs)
+
+            content = ""
+            tool_calls = []
+
+            async for chunk in response:
+                if chunk.type == "content_block_delta":
+                    if hasattr(chunk.delta, 'text'):
+                        text_content = chunk.delta.text
+                        content += text_content
+                        yield {
+                            "type": "content",
+                            "content": text_content
+                        }
+                elif chunk.type == "content_block_start":
+                    if hasattr(chunk.content_block, 'type') and chunk.content_block.type == "tool_use":
+                        tool_calls.append({
+                            "id": chunk.content_block.id,
+                            "type": "function",
+                            "function": {
+                                "name": chunk.content_block.name,
+                                "arguments": chunk.content_block.input,
+                            }
+                        })
+                elif chunk.type == "message_stop":
+                    # Send tool calls if any
+                    if tool_calls:
+                        yield {
+                            "type": "tool_calls",
+                            "tool_calls": tool_calls
+                        }
+
+                    # Send completion
+                    yield {
+                        "type": "complete",
+                        "usage": {
+                            "prompt_tokens": getattr(chunk, 'input_tokens', 0),
+                            "completion_tokens": getattr(chunk, 'output_tokens', 0),
+                            "total_tokens": getattr(chunk, 'input_tokens', 0) + getattr(chunk, 'output_tokens', 0)
+                        }
+                    }
+                    break
+
+        except Exception as e:
+            yield {
+                "type": "error",
+                "content": f"Anthropic streaming error: {str(e)}"
+            }
+
     async def is_authenticated(self) -> bool:
         """Check if Anthropic is authenticated."""
         try:

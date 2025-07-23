@@ -51,7 +51,7 @@ class SessionChatResponse(BaseModel):
 
 class StreamingSessionResponse:
     """Streaming response from session chat."""
-    
+
     def __init__(self, session_id: str, message_id: str):
         self.session_id = session_id
         self.message_id = message_id
@@ -59,29 +59,41 @@ class StreamingSessionResponse:
         self.tool_calls = []
         self.usage = None
         self.is_complete = False
-        self._chunks = []
-        self._processing_started = False
-        self._processing_complete = False
-    
+
+        # Use asyncio.Queue for proper async coordination
+        self._chunk_queue = asyncio.Queue()
+        self._processing_started = asyncio.Event()
+        self._processing_complete = asyncio.Event()
+        self._error = None
+
     def __aiter__(self):
         """Async iterator for streaming chunks."""
         return self
-    
+
     async def __anext__(self):
         """Get next chunk."""
         # Wait for processing to start
-        while not self._processing_started and not self.is_complete:
-            await asyncio.sleep(0.01)
-            
-        while True:
-            if self._chunks:
-                return self._chunks.pop(0)
-            elif self.is_complete:
+        await self._processing_started.wait()
+
+        try:
+            # Use timeout to avoid hanging indefinitely
+            chunk = await asyncio.wait_for(self._chunk_queue.get(), timeout=30.0)
+
+            # Check for sentinel value indicating completion
+            if chunk is None:
                 raise StopAsyncIteration
-            else:
-                # Wait for more chunks or completion
-                await asyncio.sleep(0.01)
-    
+
+            # Check for error
+            if isinstance(chunk, Exception):
+                raise chunk
+
+            return chunk
+
+        except asyncio.TimeoutError:
+            if self.is_complete:
+                raise StopAsyncIteration
+            raise RuntimeError("Streaming timeout - no chunks received")
+
     def add_chunk(self, chunk_type: str, content: str = "", **kwargs):
         """Add a streaming chunk."""
         chunk = {
@@ -89,16 +101,41 @@ class StreamingSessionResponse:
             "content": content,
             **kwargs
         }
-        self._chunks.append(chunk)
-        
+
+        # Add to queue in a thread-safe way
+        try:
+            self._chunk_queue.put_nowait(chunk)
+        except asyncio.QueueFull:
+            # If queue is full, this is a programming error
+            raise RuntimeError("Streaming chunk queue is full")
+
         if chunk_type == "content":
             self.content += content
-    
+
     def complete(self, usage: Optional[Dict[str, Any]] = None):
         """Mark the response as complete."""
         self.usage = usage
         self.is_complete = True
         self.add_chunk("complete")
+        # Add sentinel value to signal completion
+        try:
+            self._chunk_queue.put_nowait(None)
+        except asyncio.QueueFull:
+            pass  # Ignore if queue is full at completion
+        self._processing_complete.set()
+
+    def set_error(self, error: Exception):
+        """Set an error for the streaming response."""
+        self._error = error
+        try:
+            self._chunk_queue.put_nowait(error)
+        except asyncio.QueueFull:
+            pass  # Ignore if queue is full
+        self._processing_complete.set()
+
+    def start_processing(self):
+        """Signal that processing has started."""
+        self._processing_started.set()
 
 
 class Session:
@@ -291,7 +328,7 @@ class Session:
         async def _process_streaming():
             try:
                 # Mark processing as started
-                streaming_response._processing_started = True
+                streaming_response.start_processing()
                 
                 # Get mode configuration
                 mode = await Mode.get(request.mode)
@@ -394,11 +431,11 @@ class Session:
             except Exception as e:
                 cls._log.error("Chat error", {"error": str(e)})
                 streaming_response.add_chunk("error", f"Error: {str(e)}")
-                streaming_response.complete()
+                streaming_response.set_error(e)
             finally:
                 # Ensure processing is marked as started even if there's an error
-                if not streaming_response._processing_started:
-                    streaming_response._processing_started = True
+                if not streaming_response._processing_started.is_set():
+                    streaming_response.start_processing()
         
         # Start the async processing task and store reference
         task = asyncio.create_task(_process_streaming())
