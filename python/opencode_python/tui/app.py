@@ -55,6 +55,63 @@ class ChatMessageWidget(Static):
             self.content_widget.update(new_content)
 
 
+class HistoryInput(Input):
+    """Input widget with prompt history support."""
+    
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.history = []
+        self.history_index = -1
+        self.current_input = ""
+    
+    def add_to_history(self, text: str):
+        """Add text to history if it's not empty and not a duplicate of the last entry."""
+        text = text.strip()
+        if text and (not self.history or self.history[-1] != text):
+            self.history.append(text)
+        self.history_index = -1
+        self.current_input = ""
+    
+    def on_key(self, event: events.Key) -> None:
+        """Handle key events for history navigation."""
+        if event.key == "up":
+            if self.history:
+                if self.history_index == -1:
+                    # Starting navigation - save current input
+                    self.current_input = self.value
+                    self.history_index = len(self.history) - 1
+                else:
+                    # Move up in history
+                    self.history_index = max(0, self.history_index - 1)
+                
+                if self.history_index < len(self.history):
+                    self.value = self.history[self.history_index]
+                    self.cursor_position = len(self.value)
+                
+                event.prevent_default()
+        
+        elif event.key == "down":
+            if self.history and self.history_index != -1:
+                # Move down in history
+                self.history_index = min(len(self.history) - 1, self.history_index + 1)
+                
+                if self.history_index == len(self.history) - 1:
+                    # At the end - restore original input
+                    self.value = self.current_input
+                    self.history_index = -1
+                else:
+                    self.value = self.history[self.history_index + 1]
+                
+                self.cursor_position = len(self.value)
+                event.prevent_default()
+        
+        else:
+            # Reset history index when typing new content
+            if self.history_index != -1 and event.key not in ["up", "down"]:
+                self.history_index = -1
+            # Let the parent handle other keys normally - don't call super()
+
+
 class ChatPanel(Container):
     """Chat messages and input panel."""
     
@@ -69,7 +126,7 @@ class ChatPanel(Container):
             with Container(id="messages-container"):
                 yield Static("Welcome to OpenCode! Start a conversation below.", id="welcome-message")
             with Horizontal(id="input-container"):
-                yield Input(placeholder="Type your message here...", id="message-input")
+                yield HistoryInput(placeholder="Type your message here... Use ↑/↓ for history", id="message-input")
                 yield Button("Send", variant="primary", id="send-button")
     
     def add_message(self, role: str, content: str):
@@ -418,13 +475,14 @@ class OpenCodeTUI(App):
     
     async def action_send_message(self) -> None:
         """Send a message to the AI."""
-        message_input = self.query_one("#message-input", Input)
+        message_input = self.query_one("#message-input", HistoryInput)
         message = message_input.value.strip()
         
         if not message:
             return
         
-        # Clear input
+        # Add to history and clear input
+        message_input.add_to_history(message)
         message_input.value = ""
         
         # Get selected model
@@ -533,13 +591,16 @@ class OpenCodeTUI(App):
 - **Ctrl+L**: Clear chat
 - **Ctrl+T**: Toggle streaming/non-streaming mode
 - **Enter**: Send message (when in input field)
+- **↑ (Up Arrow)**: Navigate to previous prompt in history
+- **↓ (Down Arrow)**: Navigate to next prompt in history
 - **F1**: Show this help
 
 ## Usage
 1. Select a provider and model from the left panel
 2. Type your message in the input field
 3. Press Enter or click Send to chat with the AI
-4. Use the right panel for session management
+4. Use **↑/↓ arrow keys** to navigate through your prompt history
+5. Use the right panel for session management
 
 ## Tools Available
 The AI has access to these tools:
